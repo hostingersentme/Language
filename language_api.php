@@ -224,7 +224,7 @@ function gemini_call($model, $messages, $max_tokens=1500, $temperature=0.2){
 }
 
 // ---------- Local fallback (deterministic) ----------
-function local_analyze($prompt, $allow_facts){
+function local_analyze($prompt){
   $toks = []; preg_match_all('/[A-Za-z]+|\d+/', strtolower($prompt), $mm); $toks = $mm[0] ?? [];
   $dict = [
     'give'=>'provide to a recipient','me'=>'the speaker as recipient','a'=>'one instance','an'=>'one instance','trivial'=>'of little difficulty; simple','trivia'=>'facts of little importance; general knowledge','question'=>'a request for information','add'=>'combine quantities to form a sum','and'=>'join operands or phrases','what'=>'requests information','is'=>'copula linking subject and predicate','the'=>'definite determiner','capital'=>'principal city of a nation or state','of'=>'indicates relation or possession'
@@ -256,7 +256,7 @@ function local_analyze($prompt, $allow_facts){
     if($left!==null && $right!==null){ $mr=['intent'=>'compute','slots'=>['op'=>'+','operands'=>[$left,$right]]]; $result = $left.' + '.$right.' = '.($left+$right); }
   } elseif (preg_match('/capital of\s+([A-Za-z]+)/i',$prompt,$m)){
     $mr = ['intent'=>'ask_fact','slots'=>['kind'=>'capital_of','target'=>$m[1]]];
-    $result = $allow_facts ? '' : 'Recognized request: ask(capital_of("'.$m[1].'")) — facts disabled.';
+    $result = 'Recognized request: ask(capital_of("'.$m[1].'")) — factual data unavailable in local mode.';
   }
 
   if (!$result) $result = 'Parsed, but no deterministic definition-first action matched.';
@@ -283,7 +283,6 @@ if (!check_rate_limit('analyze', $rate_limits['analyze']['limit'], $rate_limits[
 }
 
 $prompt = trim((string)($data['prompt'] ?? ''));
-$allow_facts = !empty($data['allow_facts']);
 $recaptcha = $data['recaptcha'] ?? '';
 
 if (!verify_recaptcha($recaptcha, 'analyze', 0.3)){
@@ -310,8 +309,8 @@ Rules:
    • Never spell-correct, normalize, or substitute tokens (e.g., "Francee" ≠ "France").
    • If a token looks like a named entity but you cannot know its identity without external facts,
      set pos to NNP (or X) and gloss EXACTLY "proper noun (unknown)" or "unknown".
-   • Only label a token as a specific entity type (country, city, person, etc.) if facts_allowed==true
-     AND it can be known from the token alone without correction. Otherwise keep it unknown.
+   • Only label a token as a specific entity type (country, city, person, etc.) if it can be known
+     from the token alone without correction. Otherwise keep it unknown.
     • Define words without reference to context unless it makes it obvious which definition should apply to words that have multiple definitions.
 Examples:
   Input token "Francee" → {"token":"Francee","pos":"NNP","gloss":"proper noun (unknown)"}.
@@ -327,7 +326,7 @@ $ava_messages = [
 $ava_resp = gemini_call('gemini-2.0-flash-lite', $ava_messages, 600, 0.1);
 if ($ava_resp['status'] !== 'success'){
   lang_log(['AVA_fail'=>$ava_resp]);
-  $out = local_analyze($prompt, $allow_facts);
+  $out = local_analyze($prompt);
   $out['status'] = 'ok';
   send_json($out);
 }
@@ -336,7 +335,7 @@ $ava_text = extract_first_json(strip_code_fences($ava_resp['content']));
 $ava_json = json_decode($ava_text, true);
 if (!$ava_json || !isset($ava_json['definitions'],$ava_json['mr'])){
   lang_log(['AVA_bad_json'=>$ava_text]);
-  $out = local_analyze($prompt, $allow_facts);
+  $out = local_analyze($prompt);
   $out['status'] = 'ok';
   send_json($out);
 }
@@ -401,15 +400,11 @@ if ($needRepair) {
 }
 
 // ---------- GALA stage ----------
-$facts_str = $allow_facts ? 'true' : 'false';
 $gala_sys = <<<TXT
 You are GALA. You receive AVA's JSON (definitions + mr). Use ONLY that to produce a result.
-- facts_allowed: $facts_str
 - If mr.intent == "generate_easy_question": return a single easy question (e.g., simple arithmetic).
 - If mr.intent == "compute": compute deterministically from mr.slots (no external facts).
-- If mr.intent == "ask_fact" and facts_allowed == false: return a short clarification like
-  "Recognized request: ask(capital_of(\"X\")) — facts disabled."
-- If mr.intent == "ask_fact" and facts_allowed == true: answer succinctly if trivial OR say what info is needed.
+- If mr.intent == "ask_fact": answer succinctly when possible, or explain briefly what information is missing.
 - Otherwise: return a brief deterministic reply keyed to the MR.
 Output STRICT JSON only: {"result": string}
 No extra text.
@@ -424,7 +419,7 @@ $gala_resp = gemini_call('gemini-2.0-flash-lite', $gala_messages, 400, 0.2);
 if ($gala_resp['status'] !== 'success'){
   lang_log(['GALA_fail'=>$gala_resp]);
   // Fall back to local using AVA MR heuristics
-  $out = local_analyze($prompt, $allow_facts);
+  $out = local_analyze($prompt);
   $out['status'] = 'ok';
   send_json($out);
 }
@@ -432,7 +427,7 @@ $gala_text = extract_first_json(strip_code_fences($gala_resp['content']));
 $gala_json = json_decode($gala_text, true);
 if (!$gala_json || !isset($gala_json['result'])){
   lang_log(['GALA_bad_json'=>$gala_text]);
-  $out = local_analyze($prompt, $allow_facts);
+  $out = local_analyze($prompt);
   $out['status'] = 'ok';
   send_json($out);
 }

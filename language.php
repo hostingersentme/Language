@@ -75,7 +75,7 @@ $site_key = htmlspecialchars($recaptcha_cfg['site_key'] ?? '', ENT_QUOTES, 'UTF-
 
   <div class="wrap">
     <div class="title">Language Analyzer</div>
-    <div class="sub">Two-stage pipeline: <strong>AVA</strong> writes per-word definitions & a structured meaning; <strong>GALA</strong> consumes only those definitions to produce a reply. (No world facts unless explicitly enabled.)</div>
+    <div class="sub">Two-stage pipeline: <strong>AVA</strong> writes per-word definitions & a structured meaning; <strong>GALA</strong> consumes only those definitions to produce a reply.</div>
 
     <div class="row">
       <div class="card pad">
@@ -84,7 +84,6 @@ $site_key = htmlspecialchars($recaptcha_cfg['site_key'] ?? '', ENT_QUOTES, 'UTF-
         <div class="controls">
           <button id="analyzeBtn" class="primary">Analyze</button>
           <button id="clearBtn" class="ghost">Clear</button>
-          <label class="pill"><input type="checkbox" id="factsToggle" /> Allow facts</label>
         </div>
         <div id="status" class="muted" style="margin-top:8px"></div>
       </div>
@@ -185,18 +184,23 @@ function wordsToNumber(tokens){
   return sum || null;
 }
 
-function localAnalyze(text, allowFacts){
+function localAnalyze(text){
   const original = text.trim();
   const tokens = original.toLowerCase().match(/[a-zA-Z]+|\d+/g) || [];
   const defs = tokens.map(t=> `${t}: ${DICT[t]||'[unknown]'}`).join('\n');
 
   // heuristic intents
   let result = '';
+  const mr = { intent: 'unknown', slots: {}, original };
 
   if(tokens.includes('trivial') && tokens.includes('question')){
     result = 'What is 2 + 2?';
+    mr.intent = 'generate_easy_question';
+    mr.slots = { difficulty: 'low' };
   } else if(tokens.includes('trivia') && tokens.includes('question')){
     result = 'Here is a general-knowledge question: Which ocean is the largest?';
+    mr.intent = 'ask_fact';
+    mr.slots = { domain: 'factoids' };
   } else if(tokens[0]==='add'){
     // parse "add twenty three and fifty nine"
     const andIdx = tokens.indexOf('and');
@@ -205,21 +209,21 @@ function localAnalyze(text, allowFacts){
     if(left!=null && right!=null){
       const sum = left + right;
       result = `${left} + ${right} = ${sum}`;
+      mr.intent = 'compute';
+      mr.slots = { op: '+', operands: [left, right] };
     }
   } else if(tokens.join(' ').includes('capital of')){
-    // definition-first: do not answer unless facts allowed
     const maybe = original.match(/capital of\s+([A-Za-z]+)/i);
     const name = maybe ? maybe[1] : '[unknown]';
-    if(!allowFacts){
-      result = `Recognized request: ask(capital_of("${name}")) — facts disabled.`;
-    }
+    result = `Recognized request: ask(capital_of("${name}")) — factual data unavailable in local mode.`;
+    mr.intent = 'ask_fact';
+    mr.slots = { kind: 'capital_of', target: name };
   }
 
   if(!result){
     result = 'Parsed, but no deterministic definition-first action matched.';
   }
 
-  const mr = { intent: result.startsWith('Recognized') ? 'ask.capital' : 'execute', original };
   return { definitions: defs, result, mr };
 }
 
@@ -252,7 +256,6 @@ const el = {
   status: document.getElementById('status'),
   notice: document.getElementById('notice'),
   latency: document.getElementById('latency'),
-  facts: document.getElementById('factsToggle'),
   copyDef: document.getElementById('copyDef'),
   copyRes: document.getElementById('copyRes'),
 };
@@ -293,7 +296,7 @@ el.analyze.addEventListener('click', async ()=>{
       method: 'POST',
       credentials: 'same-origin',
       headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-      body: JSON.stringify({ action:'analyze', prompt: txt, allow_facts: !!el.facts.checked, recaptcha: token })
+      body: JSON.stringify({ action:'analyze', prompt: txt, recaptcha: token })
     });
 
     if(!resp.ok) throw new Error('Server status ' + resp.status);
@@ -311,7 +314,7 @@ el.analyze.addEventListener('click', async ()=>{
       gala: { result: '' },
       local: true
     };
-    const out = localAnalyze(txt, !!el.facts.checked);
+    const out = localAnalyze(txt);
     data.ava.definitions = out.definitions;
     data.ava.mr = out.mr;
     data.gala.result = out.result;
