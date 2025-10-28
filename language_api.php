@@ -297,25 +297,26 @@ $tokens = tokenize_words_with_offsets($prompt);
 $ava_sys = <<<TXT
 You are AVA, a definition-first analyzer. Given an input sentence, produce STRICT JSON only with fields:
 {
-  "definitions": [ {"token": string, "pos": string, "gloss": string} ... ],
+  "definitions": [ {"i": number, "token": string, "pos": string, "gloss": string} ... ],
   "mr": {"intent": string, "slots": object}
 }
 Rules:
-- Define each content token briefly (dictionary gloss). Keep 3–10 words per gloss.
-- Build a small meaning representation (mr): intent ∈ {generate_easy_question, ask_fact, compute, define, compare, unknown}; slots contains parameters (e.g., {difficulty:"low"}, {operands:[23,59], op:"+"}, {target:"Francee", kind:"capital_of"}).
-- NO preface, NO code fences, JSON ONLY.
-- Do not answer any factual question.
+- One definition entry per surface token in order; include index "i" matching the token's position (0-based).
+- Define each content token briefly (3–10 words). Do not use external facts.
 - Strict surface-form policy:
    • Never spell-correct, normalize, or substitute tokens (e.g., "Francee" ≠ "France").
-   • If a token looks like a named entity but you cannot know its identity without external facts,
+   • If a token seems like a named entity but identity is unknowable from the token alone,
      set pos to NNP (or X) and gloss EXACTLY "proper noun (unknown)" or "unknown".
-   • Only label a token as a specific entity type (country, city, person, etc.) if it can be known
-     from the token alone without correction. Otherwise keep it unknown.
-    • Define words without reference to context unless it makes it obvious which definition should apply to words that have multiple definitions.
-Examples:
-  Input token "Francee" → {"token":"Francee","pos":"NNP","gloss":"proper noun (unknown)"}.
-  Input "capital of X" → mr may be {"intent":"ask_fact","slots":{"kind":"capital_of","target":"X"}}.
-  Do NOT convert "Francee"→"France".
+   • Only mark a specific entity type if knowable from the token alone.
+- Intent set MUST come from surface cues (no guessing):
+   allowed intents = {generate_easy_question, ask_fact, compute, define, compare, echo, unknown}
+   examples:
+     • Imperative math ("add twenty and fifty") → compute {op:"+", operands:[20,50]}
+     • "capital of X" → ask_fact {kind:"capital_of", target:"X"}
+     • "define X" or "what is X" (dictionary sense) → define {target:"X"}
+     • A declarative sentence with no task/question → echo {text:"<exact input>"}
+- Do NOT answer questions; just define and structure.
+- JSON ONLY, no code fences.
 TXT;
 
 $ava_messages = [
@@ -399,19 +400,53 @@ if ($needRepair) {
   lang_log(['AVA_defs_repaired' => ['expect' => $tokCount, 'got' => $defCount]]);
 }
 
+// Build a simple list of surface tokens whose gloss is unknown
+$unknown_tokens = [];
+foreach (($ava_json['definitions'] ?? []) as $d) {
+  $g = strtolower($d['gloss'] ?? '');
+  if ($g === 'unknown' || $g === 'proper noun (unknown)') {
+    $unknown_tokens[] = (string)($d['token'] ?? '');
+  }
+}
+$unknown_tokens = array_values(array_unique(array_filter($unknown_tokens, 'strlen')));
+
 // ---------- GALA stage ----------
 $gala_sys = <<<TXT
-You are GALA. You receive AVA's JSON (definitions + mr). Use ONLY that to produce a result.
-- If mr.intent == "generate_easy_question": return a single easy question (e.g., simple arithmetic).
-- If mr.intent == "compute": compute deterministically from mr.slots (no external facts).
-- If mr.intent == "ask_fact": answer succinctly when possible, or explain briefly what information is missing.
-- Otherwise: return a brief deterministic reply keyed to the MR.
-Output STRICT JSON only: {"result": string}
-No extra text.
+You are GALA. You receive AVA_JSON plus the exact RAW_INPUT and TOKENS. Use ONLY this information
+(no external facts, no spell correction, no probabilities).
+
+Output STRICT JSON only: {"result": string, "meta": {"mode": string, "unknown": string[]}}
+- Always include "result".
+- "meta" is optional; if you include it, set:
+    mode ∈ {"computed","fact","define","compare","echo","clarify","fallback"}
+    unknown = array of surface tokens AVA marked unknown.
+
+Behavior:
+1) If mr.intent == "compute": deterministically compute from mr.slots (e.g., operands/op). meta.mode="computed".
+2) If mr.intent == "ask_fact":
+   - If the target token(s) are marked unknown/proper noun (unknown), ask ONE concise clarifying question
+     that quotes the exact token(s). Do not propose a correction. meta.mode="clarify".
+   - Otherwise, say you cannot answer without external facts. meta.mode="clarify".
+3) If mr.intent == "define": return brief dictionary-style definitions taken ONLY from AVA_JSON.definitions
+   for the relevant token(s). meta.mode="define".
+4) If mr.intent == "compare": return a minimal, literal comparison scaffold based solely on AVA definitions
+   (no world knowledge). meta.mode="compare".
+5) If mr.intent == "echo": return RAW_INPUT verbatim. If UNKNOWN_TOKENS is non-empty, instead ask ONE
+   concise clarifying question quoting those tokens (no corrections). meta.mode="echo" or "clarify".
+6) For mr.intent == "unknown" (or anything else):
+   - Prefer a single clarifying question that quotes the ambiguous/unknown token(s) if any,
+     else return RAW_INPUT verbatim. meta.mode="clarify" or "fallback".
+
+Never write "I don't understand" or "unclear intent".
+Never alter RAW_INPUT text. Never introduce facts not contained in AVA_JSON or RAW_INPUT.
+JSON ONLY. No code fences.
 TXT;
 
 $gala_messages = [
   ['role'=>'user','content'=>$gala_sys],
+  ['role'=>'user','content'=>'RAW_INPUT: ' . $prompt],
+  ['role'=>'user','content'=>'TOKENS: ' . json_encode($tokens, JSON_UNESCAPED_UNICODE)],
+  ['role'=>'user','content'=>'UNKNOWN_TOKENS: ' . json_encode($unknown_tokens, JSON_UNESCAPED_UNICODE)],
   ['role'=>'user','content'=>'AVA_JSON: ' . json_encode($ava_json, JSON_UNESCAPED_UNICODE)]
 ];
 
@@ -434,12 +469,17 @@ if (!$gala_json || !isset($gala_json['result'])){
   send_json($out);
 }
 
+$gala_payload = ['result' => $gala_json['result']];
+if (isset($gala_json['meta']) && is_array($gala_json['meta'])) {
+  $gala_payload['meta'] = $gala_json['meta'];
+}
+
 send_json([
   'status' => 'ok',
   'ava'    => [
     'definitions' => $ava_json['definitions'],
     'mr'          => $ava_json['mr'],
   ],
-  'gala'   => [ 'result' => $gala_json['result'] ],
+  'gala'   => $gala_payload,
   'used'   => 'gemini'
 ]);
