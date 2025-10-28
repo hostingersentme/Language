@@ -415,6 +415,8 @@ $gala_messages = [
   ['role'=>'user','content'=>'AVA_JSON: ' . json_encode($ava_json, JSON_UNESCAPED_UNICODE)]
 ];
 
+lang_log(['GALA_request' => $gala_messages]);
+
 $gala_resp = gemini_call('gemini-2.0-flash-lite', $gala_messages, 400, 0.2);
 if ($gala_resp['status'] !== 'success'){
   lang_log(['GALA_fail'=>$gala_resp]);
