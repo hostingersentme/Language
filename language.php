@@ -59,6 +59,9 @@ $site_key = htmlspecialchars($recaptcha_cfg['site_key'] ?? '', ENT_QUOTES, 'UTF-
     .err{color:var(--err)}
     details{background:#0e1431;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:8px}
     summary{cursor:pointer;color:#cfe3ff}
+    .chatlog{min-height:160px;background:#0a0f24;border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:10px;overflow:auto}
+    .chatlog .u{color:#cfe3ff}
+    .chatlog .a{color:#28c76f}
   </style>
   <?php if ($site_key): ?>
   <script src="https://www.google.com/recaptcha/api.js?render=<?=$site_key?>" async defer></script>
@@ -111,6 +114,34 @@ $site_key = htmlspecialchars($recaptcha_cfg['site_key'] ?? '', ENT_QUOTES, 'UTF-
         <div class="hdr"><h3>GALA • Result</h3><button id="copyRes" class="ghost" style="font-size:12px">Copy</button></div>
         <div id="result" class="box"></div>
       </div>
+    </div>
+
+    <div style="height:16px"></div>
+    <div class="card pad" id="supervisor">
+      <div class="hdr">
+        <h3>Supervisor • Gemini 2.5 Pro</h3>
+        <span class="muted">session-context chat</span>
+      </div>
+
+      <div id="supervisorLog" class="chatlog mono"></div>
+
+      <textarea id="supervisorMsg"
+        placeholder="Tell Gemini what was wrong and how to fix it… (e.g., ‘Don’t autocorrect unknown tokens; ensure meta.mode=clarify on unknown proper nouns.’)"></textarea>
+
+      <div class="controls">
+        <button id="supervisorSend" class="primary">Send</button>
+        <button id="supervisorPropose" class="ghost" title="Ask for a minimal unified diff patch">
+          Propose Patch
+        </button>
+        <button id="supervisorApply" class="ghost" title="Apply last proposed patch">
+          Apply Last Patch
+        </button>
+        <button id="supervisorReset" class="ghost" title="Clear the conversation">
+          Reset
+        </button>
+      </div>
+
+      <div id="supStatus" class="muted" style="margin-top:8px"></div>
     </div>
 
   </div>
@@ -255,10 +286,25 @@ const el = {
   facts: document.getElementById('factsToggle'),
   copyDef: document.getElementById('copyDef'),
   copyRes: document.getElementById('copyRes'),
+  supLog: document.getElementById('supervisorLog'),
+  supMsg: document.getElementById('supervisorMsg'),
+  supSend: document.getElementById('supervisorSend'),
+  supPropose: document.getElementById('supervisorPropose'),
+  supApply: document.getElementById('supervisorApply'),
+  supReset: document.getElementById('supervisorReset'),
+  supStatus: document.getElementById('supStatus'),
 };
 
 el.copyDef.addEventListener('click', ()=>copyText('definitions'));
 el.copyRes.addEventListener('click', ()=>copyText('result'));
+
+function supLine(role, text){
+  const cls = role === 'user' ? 'u' : 'a';
+  const div = document.createElement('div');
+  div.innerHTML = `<strong class="${cls}">${role}:</strong> ${escapeHtml(text)}`;
+  el.supLog.appendChild(div);
+  el.supLog.scrollTop = el.supLog.scrollHeight;
+}
 
 el.clear.addEventListener('click', ()=>{
   el.input.value='';
@@ -339,6 +385,60 @@ el.analyze.addEventListener('click', async ()=>{
   } catch (e){
     el.notice.innerHTML = '<span class="err">Render error</span> ' + escapeHtml(e.message);
   }
+});
+
+el.supSend.addEventListener('click', async ()=>{
+  const msg = (el.supMsg.value || '').trim();
+  if(!msg){ toast('Type a message for Supervisor.'); return; }
+  el.supSend.disabled = true;
+  try{
+    supLine('user', msg);
+    const resp = await fetch('guardian_agent.php?action=chat', {
+      method: 'POST',
+      headers: {'Content-Type':'application/x-www-form-urlencoded'},
+      body: 'message=' + encodeURIComponent(msg)
+    });
+    const data = await parseJsonSafe(resp);
+    if(data.status !== 'ok') throw new Error(data.error || 'chat failed');
+    supLine('assistant', data.reply);
+    el.supStatus.textContent = 'ok • supervisor replied';
+    el.supMsg.value = '';
+  }catch(e){ el.supStatus.textContent = 'error: ' + e.message; }
+  finally{ el.supSend.disabled = false; }
+});
+
+el.supPropose.addEventListener('click', async ()=>{
+  const msg = (el.supMsg.value || '').trim();
+  el.supPropose.disabled = true;
+  try{
+    if(msg) supLine('user', msg);
+    const resp = await fetch('guardian_agent.php?action=chat_patch', {
+      method: 'POST',
+      headers: {'Content-Type':'application/x-www-form-urlencoded'},
+      body: 'message=' + encodeURIComponent(msg)
+    });
+    const data = await parseJsonSafe(resp);
+    if(data.status !== 'ok') throw new Error(data.error || 'patch failed');
+    el.supStatus.innerHTML = 'Patch proposed and stored. <span class="ok">preview ok</span>. You can now click “Apply Last Patch”.';
+  }catch(e){ el.supStatus.textContent = 'error: ' + e.message; }
+  finally{ el.supPropose.disabled = false; }
+});
+
+el.supApply.addEventListener('click', async ()=>{
+  el.supApply.disabled = true;
+  try{
+    const resp = await fetch('guardian_agent.php?action=apply_last');
+    const data = await parseJsonSafe(resp);
+    if(data.status !== 'ok') throw new Error(data.error || 'apply failed');
+    el.supStatus.innerHTML = '<span class="ok">Patched & tests pass.</span>';
+  }catch(e){ el.supStatus.textContent = 'error: ' + e.message; }
+  finally{ el.supApply.disabled = false; }
+});
+
+el.supReset.addEventListener('click', async ()=>{
+  el.supLog.innerHTML = '';
+  el.supStatus.textContent = 'cleared.';
+  await fetch('guardian_agent.php?action=chat&reset=1&message=' + encodeURIComponent('[reset]'), { method: 'POST' });
 });
 </script>
 </body>
