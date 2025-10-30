@@ -224,7 +224,7 @@ function gemini_call($model, $messages, $max_tokens=1500, $temperature=0.2){
 }
 
 // ---------- Local fallback (deterministic) ----------
-function local_analyze($prompt, $allow_facts){
+function local_analyze($prompt){
   $toks = []; preg_match_all('/[A-Za-z]+|\d+/', strtolower($prompt), $mm); $toks = $mm[0] ?? [];
   $dict = [
     'give'=>'provide to a recipient','me'=>'the speaker as recipient','a'=>'one instance','an'=>'one instance','trivial'=>'of little difficulty; simple','trivia'=>'facts of little importance; general knowledge','question'=>'a request for information','add'=>'combine quantities to form a sum','and'=>'join operands or phrases','what'=>'requests information','is'=>'copula linking subject and predicate','the'=>'definite determiner','capital'=>'principal city of a nation or state','of'=>'indicates relation or possession'
@@ -256,7 +256,7 @@ function local_analyze($prompt, $allow_facts){
     if($left!==null && $right!==null){ $mr=['intent'=>'compute','slots'=>['op'=>'+','operands'=>[$left,$right]]]; $result = $left.' + '.$right.' = '.($left+$right); }
   } elseif (preg_match('/capital of\s+([A-Za-z]+)/i',$prompt,$m)){
     $mr = ['intent'=>'ask_fact','slots'=>['kind'=>'capital_of','target'=>$m[1]]];
-    $result = $allow_facts ? '' : 'Recognized request: ask(capital_of("'.$m[1].'")) — facts disabled.';
+    $result = 'Recognized request: ask(capital_of("'.$m[1].'")) — factual data unavailable in local mode.';
   }
 
   if (!$result) $result = 'Parsed, but no deterministic definition-first action matched.';
@@ -283,7 +283,6 @@ if (!check_rate_limit('analyze', $rate_limits['analyze']['limit'], $rate_limits[
 }
 
 $prompt = trim((string)($data['prompt'] ?? ''));
-$allow_facts = !empty($data['allow_facts']);
 $recaptcha = $data['recaptcha'] ?? '';
 
 if (!verify_recaptcha($recaptcha, 'analyze', 0.3)){
@@ -298,25 +297,26 @@ $tokens = tokenize_words_with_offsets($prompt);
 $ava_sys = <<<TXT
 You are AVA, a definition-first analyzer. Given an input sentence, produce STRICT JSON only with fields:
 {
-  "definitions": [ {"token": string, "pos": string, "gloss": string} ... ],
+  "definitions": [ {"i": number, "token": string, "pos": string, "gloss": string} ... ],
   "mr": {"intent": string, "slots": object}
 }
 Rules:
-- Define each content token briefly (dictionary gloss). Keep 3–10 words per gloss.
-- Build a small meaning representation (mr): intent ∈ {generate_easy_question, ask_fact, compute, define, compare, unknown}; slots contains parameters (e.g., {difficulty:"low"}, {operands:[23,59], op:"+"}, {target:"Francee", kind:"capital_of"}).
-- NO preface, NO code fences, JSON ONLY.
-- Do not answer any factual question.
+- One definition entry per surface token in order; include index "i" matching the token's position (0-based).
+- Define each content token briefly (3–10 words). Do not use external facts.
 - Strict surface-form policy:
    • Never spell-correct, normalize, or substitute tokens (e.g., "Francee" ≠ "France").
-   • If a token looks like a named entity but you cannot know its identity without external facts,
+   • If a token seems like a named entity but identity is unknowable from the token alone,
      set pos to NNP (or X) and gloss EXACTLY "proper noun (unknown)" or "unknown".
-   • Only label a token as a specific entity type (country, city, person, etc.) if facts_allowed==true
-     AND it can be known from the token alone without correction. Otherwise keep it unknown.
-    • Define words without reference to context unless it makes it obvious which definition should apply to words that have multiple definitions.
-Examples:
-  Input token "Francee" → {"token":"Francee","pos":"NNP","gloss":"proper noun (unknown)"}.
-  Input "capital of X" → mr may be {"intent":"ask_fact","slots":{"kind":"capital_of","target":"X"}}.
-  Do NOT convert "Francee"→"France".
+   • Only mark a specific entity type if knowable from the token alone.
+- Intent set MUST come from surface cues (no guessing):
+   allowed intents = {generate_easy_question, ask_fact, compute, define, compare, echo, unknown}
+   examples:
+     • Imperative math ("add twenty and fifty") → compute {op:"+", operands:[20,50]}
+     • "capital of X" → ask_fact {kind:"capital_of", target:"X"}
+     • "define X" or "what is X" (dictionary sense) → define {target:"X"}
+     • A declarative sentence with no task/question → echo {text:"<exact input>"}
+- Do NOT answer questions; just define and structure.
+- JSON ONLY, no code fences.
 TXT;
 
 $ava_messages = [
@@ -327,7 +327,7 @@ $ava_messages = [
 $ava_resp = gemini_call('gemini-2.0-flash-lite', $ava_messages, 600, 0.1);
 if ($ava_resp['status'] !== 'success'){
   lang_log(['AVA_fail'=>$ava_resp]);
-  $out = local_analyze($prompt, $allow_facts);
+  $out = local_analyze($prompt);
   $out['status'] = 'ok';
   send_json($out);
 }
@@ -336,7 +336,7 @@ $ava_text = extract_first_json(strip_code_fences($ava_resp['content']));
 $ava_json = json_decode($ava_text, true);
 if (!$ava_json || !isset($ava_json['definitions'],$ava_json['mr'])){
   lang_log(['AVA_bad_json'=>$ava_text]);
-  $out = local_analyze($prompt, $allow_facts);
+  $out = local_analyze($prompt);
   $out['status'] = 'ok';
   send_json($out);
 }
@@ -400,31 +400,63 @@ if ($needRepair) {
   lang_log(['AVA_defs_repaired' => ['expect' => $tokCount, 'got' => $defCount]]);
 }
 
+// Build a simple list of surface tokens whose gloss is unknown
+$unknown_tokens = [];
+foreach (($ava_json['definitions'] ?? []) as $d) {
+  $g = strtolower($d['gloss'] ?? '');
+  if ($g === 'unknown' || $g === 'proper noun (unknown)') {
+    $unknown_tokens[] = (string)($d['token'] ?? '');
+  }
+}
+$unknown_tokens = array_values(array_unique(array_filter($unknown_tokens, 'strlen')));
+
 // ---------- GALA stage ----------
-$facts_str = $allow_facts ? 'true' : 'false';
 $gala_sys = <<<TXT
-You are GALA. You receive AVA's JSON (definitions + mr). Use ONLY that to produce a result.
-- facts_allowed: $facts_str
-- If mr.intent == "generate_easy_question": return a single easy question (e.g., simple arithmetic).
-- If mr.intent == "compute": compute deterministically from mr.slots (no external facts).
-- If mr.intent == "ask_fact" and facts_allowed == false: return a short clarification like
-  "Recognized request: ask(capital_of(\"X\")) — facts disabled."
-- If mr.intent == "ask_fact" and facts_allowed == true: answer succinctly if trivial OR say what info is needed.
-- Otherwise: return a brief deterministic reply keyed to the MR.
-Output STRICT JSON only: {"result": string}
-No extra text.
+You are GALA. You receive AVA_JSON plus the exact RAW_INPUT and TOKENS. Use ONLY this information
+(no external facts, no spell correction, no probabilities).
+
+Output STRICT JSON only: {"result": string, "meta": {"mode": string, "unknown": string[]}}
+- Always include "result".
+- "meta" is optional; if you include it, set:
+    mode ∈ {"computed","fact","define","compare","echo","clarify","fallback"}
+    unknown = array of surface tokens AVA marked unknown.
+
+Behavior:
+1) If mr.intent == "compute": deterministically compute from mr.slots (e.g., operands/op). meta.mode="computed".
+2) If mr.intent == "ask_fact":
+   - If the target token(s) are marked unknown/proper noun (unknown), ask ONE concise clarifying question
+     that quotes the exact token(s). Do not propose a correction. meta.mode="clarify".
+   - Otherwise, say you cannot answer without external facts. meta.mode="clarify".
+3) If mr.intent == "define": return brief dictionary-style definitions taken ONLY from AVA_JSON.definitions
+   for the relevant token(s). meta.mode="define".
+4) If mr.intent == "compare": return a minimal, literal comparison scaffold based solely on AVA definitions
+   (no world knowledge). meta.mode="compare".
+5) If mr.intent == "echo": return RAW_INPUT verbatim. If UNKNOWN_TOKENS is non-empty, instead ask ONE
+   concise clarifying question quoting those tokens (no corrections). meta.mode="echo" or "clarify".
+6) For mr.intent == "unknown" (or anything else):
+   - Prefer a single clarifying question that quotes the ambiguous/unknown token(s) if any,
+     else return RAW_INPUT verbatim. meta.mode="clarify" or "fallback".
+
+Never write "I don't understand" or "unclear intent".
+Never alter RAW_INPUT text. Never introduce facts not contained in AVA_JSON or RAW_INPUT.
+JSON ONLY. No code fences.
 TXT;
 
 $gala_messages = [
   ['role'=>'user','content'=>$gala_sys],
+  ['role'=>'user','content'=>'RAW_INPUT: ' . $prompt],
+  ['role'=>'user','content'=>'TOKENS: ' . json_encode($tokens, JSON_UNESCAPED_UNICODE)],
+  ['role'=>'user','content'=>'UNKNOWN_TOKENS: ' . json_encode($unknown_tokens, JSON_UNESCAPED_UNICODE)],
   ['role'=>'user','content'=>'AVA_JSON: ' . json_encode($ava_json, JSON_UNESCAPED_UNICODE)]
 ];
+
+lang_log(['GALA_request' => $gala_messages]);
 
 $gala_resp = gemini_call('gemini-2.0-flash-lite', $gala_messages, 400, 0.2);
 if ($gala_resp['status'] !== 'success'){
   lang_log(['GALA_fail'=>$gala_resp]);
   // Fall back to local using AVA MR heuristics
-  $out = local_analyze($prompt, $allow_facts);
+  $out = local_analyze($prompt);
   $out['status'] = 'ok';
   send_json($out);
 }
@@ -432,9 +464,14 @@ $gala_text = extract_first_json(strip_code_fences($gala_resp['content']));
 $gala_json = json_decode($gala_text, true);
 if (!$gala_json || !isset($gala_json['result'])){
   lang_log(['GALA_bad_json'=>$gala_text]);
-  $out = local_analyze($prompt, $allow_facts);
+  $out = local_analyze($prompt);
   $out['status'] = 'ok';
   send_json($out);
+}
+
+$gala_payload = ['result' => $gala_json['result']];
+if (isset($gala_json['meta']) && is_array($gala_json['meta'])) {
+  $gala_payload['meta'] = $gala_json['meta'];
 }
 
 send_json([
@@ -443,6 +480,6 @@ send_json([
     'definitions' => $ava_json['definitions'],
     'mr'          => $ava_json['mr'],
   ],
-  'gala'   => [ 'result' => $gala_json['result'] ],
+  'gala'   => $gala_payload,
   'used'   => 'gemini'
 ]);
